@@ -1,0 +1,37 @@
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints/
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.env
+.venv/
+env/
+venv/
+
+# VS Code workspace settings
+.vscode/
+
+# macOS Finder files
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# Test caches
+.pytest_cache/
+
+# Build/dist
+build/
+dist/
+*.egg-info/
+
+# Data files (we’re using Git LFS for everything in data/)
+data/*
+
+# Ignore any local secrets or creds
+*.env
