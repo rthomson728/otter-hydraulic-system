@@ -22,6 +22,8 @@ thresholds = {
     'SCM1_HP_CONS': (30, 450),
 }
 
+cov_columns = ["SCM1_LP1_COV", "SCM1_HP_COV","SCM2_LP1_COV", "SCM2_HP_COV"]
+
 # PCV/WCV columns to clean
 pcv_columns = ['P1_PCV','P2_PCV','P3_PCV','I1_PCV','I2_PCV']
 
@@ -49,6 +51,7 @@ pump_events_path = r"C:\Users\rosst\OneDrive\Control Integrity\otter-hydraulic-s
 
 # Processd rop lsop deata. This took 36 hourrs to run
 drop_slope_data_path= r"C:\Users\rosst\OneDrive\Control Integrity\otter-hydraulic-system\data\Slope_Features_Only.parquet"
+SCM_drop_slope_data_path = r"C:\Users\rosst\OneDrive\Control Integrity\otter-hydraulic-system\data\Slope_Features_Only_SCM.parquet"
 
 #For umb charge event sid
 thresholds = {
@@ -58,4 +61,13 @@ thresholds = {
     'HPU_HPB_OUT': (30, 440),     # HPB pressure indicator
     'HPU_LPA_OUT': (20, 180),     # LPB pressure indicator
     'HPU_HPA_OUT': (20, 440),     # HPB pressure indicator
+}
+
+valve_state_map = {
+    "OPEN": 1,
+    "CLOSED": 0,
+    "FAULT": -1,
+    "No Data": -1,
+    "TIMEOUT": -1,
+    "UNKNOWN": -1,
 }

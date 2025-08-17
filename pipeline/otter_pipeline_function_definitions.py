@@ -39,6 +39,7 @@ thresholds = {
     'SCM1_LP_CONS': (30, 190),
     'SCM1_HP_CONS': (30, 450),
 }
+cov_columns = ["SCM1_LP1_COV", "SCM1_HP_COV","SCM2_LP1_COV", "SCM2_HP_COV"]
 
 # PCV/WCV columns to clean
 pcv_columns = ['P1_PCV','P2_PCV','P3_PCV','I1_PCV','I2_PCV']
@@ -67,6 +68,7 @@ pump_events_path = r"C:\Users\rosst\OneDrive\Control Integrity\otter-hydraulic-s
 
 # Processd rop lsop deata. This took 36 hourrs to run
 drop_slope_data_path= r"C:\Users\rosst\OneDrive\Control Integrity\otter-hydraulic-system\data\Slope_Features_Only.parquet"
+SCM_drop_slope_data_path = r"C:\Users\rosst\OneDrive\Control Integrity\otter-hydraulic-system\data\Slope_Features_Only_SCM.parquet"
 
 #For umb charge event sid
 thresholds = {
@@ -76,6 +78,15 @@ thresholds = {
     'HPU_HPB_OUT': (30, 440),     # HPB pressure indicator
     'HPU_LPA_OUT': (20, 180),     # LPB pressure indicator
     'HPU_HPA_OUT': (20, 440),     # HPB pressure indicator
+}
+
+valve_state_map = {
+    "OPEN": 1,
+    "CLOSED": 0,
+    "FAULT": -1,
+    "No Data": -1,
+    "TIMEOUT": -1,
+    "UNKNOWN": -1,
 }
 ######################################################################################################################################################################
 def load_and_clean_otter_data(parquet_path: str,columns_to_remove: list) -> pd.DataFrame:
@@ -98,13 +109,33 @@ def load_and_clean_otter_data(parquet_path: str,columns_to_remove: list) -> pd.D
         columns={'HPU-RET_LEV': 'HPU_RET_LEV'},
         inplace=True
     )
+    
+    #Replace the Data in HPU_RET_LEV (data seems corrupted) with HPU_RET_LEV_B (this is the reduddnat backup transmitteR)
+    df_all_otter["HPU_RET_LEV"] = df_all_otter["HPU-RET_LEV_B"]
+    
 
     # only drop the ones that actually exist
     existing = [c for c in columns_to_remove if c in df_all_otter.columns]
     df_all_otter.drop(columns=existing, inplace=True)
 
-    # 5) Report & return
-    print(f"Loaded {df_all_otter.shape[0]} rows × {df_all_otter.shape[1]} cols")
+  
+    
+        # 6) Encode SCM crossover valve states (e.g., LP1, LP2, faults)
+    cov_encoding_map = {
+        "LP2": 2,
+        "HP2": 2,
+        "LP1": 1,
+        "HP1": 1,
+    }
+
+    # Auto-detect all columns that end with '_COV'
+    cov_columns = [col for col in df_all_otter.columns if col.endswith('_COV')]
+
+    for col in cov_columns:
+        df_all_otter[col] = df_all_otter[col].map(cov_encoding_map).fillna(1).astype(int)
+            
+      # 5) Report & return
+    print(f"Loaded {df_all_otter.shape[0]} rows × {df_all_otter.shape[1]} cols")        
     return df_all_otter
 
 ################################################################################################################################################################
@@ -497,6 +528,90 @@ def system_fluid_consumption(
 
     return df
 ################################################################################################################################################################
+import pandas as pd
+import numpy as np
+
+def system_fluid_consumption_v2(
+    df,
+    supply_col="HPU_SPLY_LEV_L",
+    return_col="HPU_RET_LEV_L",
+    timestamp_col=None,
+    eps=0.0,                 # ignore tiny |ΔTotal| < eps (litres)
+    write_rate_col=True,     # also write 'Supply_Consumption_Rate_L_per_h'
+):
+    """
+    Compute system consumption as the negative gradient of Total = Supply + Return.
+    - Only negative changes in Total are counted as consumption (fills are ignored).
+    - Handles irregular timestamps (time-delta aware).
+    - Adds/overwrites columns (in-place):
+        'Supply_Consumption_Excl_Fills'               [L per step]
+        'Cumulative_Supply_Consumption_Excl_Fills'    [L]
+        (optional) 'Supply_Consumption_Rate_L_per_h'  [L/hour]
+    """
+
+    # --- Ensure datetime index ---
+    if not isinstance(df.index, pd.DatetimeIndex):
+        if timestamp_col is None:
+            for c in ["timestamp","time","date","datetime","Datestamp"]:
+                if c in df.columns:
+                    timestamp_col = c
+                    break
+        if timestamp_col is None:
+            raise ValueError("Provide a datetime index or `timestamp_col`.")
+        df.set_index(pd.to_datetime(df[timestamp_col], utc=True, errors="coerce"), inplace=True)
+
+    df.sort_index(inplace=True)
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert("UTC").tz_localize(None)
+
+    # --- Build Total where both are finite ---
+    s = df[supply_col].to_numpy(dtype="float64", copy=False)
+    r = df[return_col].to_numpy(dtype="float64", copy=False)
+    total = np.where(np.isfinite(s) & np.isfinite(r), s + r, np.nan)
+
+    # --- Time deltas (seconds) between consecutive points ---
+    # Use NaN where either current or previous total is NaN (don't count across gaps)
+    idx = df.index.view("int64")  # ns since epoch
+    dt_sec = np.empty_like(total)
+    dt_sec[:] = np.nan
+    valid = np.isfinite(total)
+    valid_pairs = valid & np.roll(valid, 1)
+    dt_sec[valid_pairs] = (idx[valid_pairs] - np.roll(idx, 1)[valid_pairs]) / 1e9  # ns -> s
+
+    # --- Total change across valid consecutive points ---
+    dtotal = np.empty_like(total)
+    dtotal[:] = np.nan
+    dtotal[valid_pairs] = total[valid_pairs] - np.roll(total, 1)[valid_pairs]
+
+    # --- Optional noise threshold in L ---
+    if eps > 0:
+        small = np.abs(dtotal) < eps
+        dtotal[small] = 0.0
+
+    # --- Consumption as negative gradient of Total ---
+    # Per step litres consumed (positive when Total decreases)
+    consumption_step_L = np.maximum(0.0, -np.nan_to_num(dtotal, nan=0.0))
+
+    # Optional rate (L/hour), time-aware
+    if write_rate_col:
+        rate = np.full_like(consumption_step_L, np.nan, dtype="float64")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            rate_vals = consumption_step_L / (dt_sec / 3600.0)
+        # Only keep where dt>0; else NaN
+        rate[(dt_sec > 0)] = rate_vals[(dt_sec > 0)]
+        df["Supply_Consumption_Rate_L_per_h"] = rate
+
+    # Cumulative litres consumed
+    cum_consumption = np.nancumsum(consumption_step_L)
+
+    # --- Write results ---
+    df["Supply_Consumption_Excl_Fills"] = consumption_step_L
+    df["Cumulative_Supply_Consumption_Excl_Fills"] = cum_consumption
+
+    return df
+
+#################################################################################################################
+
 
 def add_external_losses(
     df: pd.DataFrame,
@@ -959,7 +1074,7 @@ def add_slope_features(
     return df_aug
 ################################################################################################################################################################
 def clean_dataframe(df):
-    # 1. Columns to drop
+    # 1. Drop unnecessary columns
     cols_to_drop = [
         'HPU_SPLY_LEV_B', 'HPU-RET_LEV_B', 'P1_PMV_OpenToClosed', 'P1_PMV_ClosedToOpen', 'P1_PWV_OpenToClosed',
         'P1_PWV_ClosedToOpen', 'P1_AMV_OpenToClosed', 'P1_AMV_ClosedToOpen', 'P1_SCSSV_OpenToClosed',
@@ -975,17 +1090,22 @@ def clean_dataframe(df):
         'I2_PMV_ClosedToOpen', 'I2_PWV_OpenToClosed', 'I2_PWV_ClosedToOpen', 'I2_AMV_OpenToClosed',
         'I2_AMV_ClosedToOpen', 'MPMV_Inlet_OpenToClosed', 'MPMV_Inlet_ClosedToOpen', 'Man_CI_OpenToClosed',
         'Man_CI_ClosedToOpen', 'SCM1_LP1_COV_OpenToClosed', 'SCM1_LP1_COV_ClosedToOpen', 'SCM1_HP_COV_OpenToClosed',
-        'SCM1_HP_COV_ClosedToOpen'
+        'SCM1_HP_COV_ClosedToOpen', 'HPU_SPLY_LEV', 'HPU_RET_LEV', '2_LP_Valve_OpenToClosed',
+        '2_LP_Valve_ClosedToOpen', '5_LP_Valve_OpenToClosed', '5_LP_Valve_ClosedToOpen', 'HP_Valve_OpenToClosed',
+        'HP_Valve_ClosedToOpen', 'Cumulative_Valve_Operation_Fluid', 'Cumulative_FCV_Fluid_Usage',
+        'Cumulative_PCV_Fluid_Usage', 'cum_umbilical_charge_volume', 'Cumulative_Supply_Consumption_Excl_Fills',
+        'External_Loss_EWM_30d', 'baseline_drop_L', 'Supply_Slope_1H_Lph', 'Supply_Slope_7D_Lph',
+        'P3_PDV_num', 'FCV_FullSteps'
     ]
     df = df.drop(columns=[col for col in cols_to_drop if col in df.columns], errors='ignore')
 
-    # 2. Move HPU_SPLY_LEV_L and HPU_RET_LEV_L to the front
+    # 2. Move key columns to front
     lead_cols = ['HPU_SPLY_LEV_L', 'HPU_RET_LEV_L']
     existing_lead_cols = [col for col in lead_cols if col in df.columns]
     other_cols = [col for col in df.columns if col not in existing_lead_cols]
     df = df[existing_lead_cols + other_cols]
 
-    # 3. Rename slope columns
+    # 3. Rename slope and MA/EWM columns
     slope_rename_map = {
         'Slope_1H_Lph': 'Supply_Slope_1H_Lph',
         'Slope_2H_Lph': 'Supply_Slope_2H_Lph',
@@ -994,7 +1114,6 @@ def clean_dataframe(df):
         'Slope_7D_Lph': 'Supply_Slope_7D_Lph'
     }
 
-    # 4. Rename MA/EWM columns
     external_rename_map = {
         'MA_2h': 'External_Loss_MA_2h',
         'MA_12h': 'External_Loss_MA_12h',
@@ -1005,13 +1124,53 @@ def clean_dataframe(df):
         'EWM_30d': 'External_Loss_EWM_30d'
     }
 
-    # Combine and apply renaming
     rename_map = {**slope_rename_map, **external_rename_map}
     df = df.rename(columns=rename_map)
 
-    return df
-################################################################################################################################################################
+    # 5. Clean FCV columns
+    for col in ['FCV_CALC', 'FCV_CPI']:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
 
+    # 6. Encode valve states
+    valve_state_map = {
+        "OPEN": 1,
+        "CLOSED": 0,
+        "FAULT": -1,
+        "No Data": -1,
+        "TIMEOUT": -1,
+        "UNKNOWN": -1,
+    }
+
+    valve_columns = [
+        'P1_PMV', 'P1_PWV', 'P1_AMV', 'P1_SCSSV', 'P1_PDV', 'P1_TDV',
+        'P2_PMV', 'P2_PWV', 'P2_AMV', 'P2_SCSSV', 'P2_PDV', 'P2_TDV',
+        'P3_PMV', 'P3_PWV', 'P3_AMV', 'P3_SCSSV', 'P3_PDV', 'P3_TDV',
+        'I1_PMV', 'I1_PWV', 'I1_AMV',
+        'I2_PMV', 'I2_PWV', 'I2_AMV',
+        'MPMV_Inlet', 'Man_CI', 'SCM1_LP1_COV', 'SCM1_HP_COV'
+    ]
+
+    for col in valve_columns:
+        if col in df.columns:
+            df[col] = df[col].map(valve_state_map).fillna(-1).astype(int)
+
+    # 7. Special override: treat FAULT as OPEN
+    override_fault_open = ['P3_PDV', 'I2_AMV', 'P3_PWV', 'P3_AMV']
+    for col in override_fault_open:
+        if col in df.columns:
+            df[col] = df[col].replace(-1, 1)
+
+    # 8. Final safety check: convert all non-numeric to NaN
+    for col in df.columns:
+        if not pd.api.types.is_numeric_dtype(df[col]):
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    return df
+
+
+
+################################################################################################################################################################
 
 def run_full_pipeline(
     parquet_path: str,
@@ -1049,7 +1208,7 @@ def run_full_pipeline(
         channel_thresholds=thresholds
     )
 
-    df = system_fluid_consumption(df)
+    df = system_fluid_consumption_v2(df)
     df = add_external_losses(df)
     df = add_external_loss_moving_averages(df)
 
@@ -1081,8 +1240,91 @@ def run_full_pipeline(
 
     df = add_slope_features(df, drop_slope_data_path)
   
+    #df= clean_dataframe(df)
 
     return df
 ################################################################################################################
 
+def summarise_dataframe(df):
+    summary = []
 
+    for col in df.columns:
+        dtype = df[col].dtype
+        n_missing = df[col].isna().sum()
+        n_unique = df[col].nunique(dropna=True)
+        example_vals = df[col].dropna().unique()[:5]  # first 5 unique non-null values
+
+        col_summary = {
+            'Column': col,
+            'DType': dtype,
+            'Missing': n_missing,
+            'Unique': n_unique,
+            'Examples': example_vals
+        }
+
+        if pd.api.types.is_numeric_dtype(df[col]):
+            col_summary['Mean'] = df[col].mean()
+            col_summary['Std'] = df[col].std()
+            col_summary['Min'] = df[col].min()
+            col_summary['Max'] = df[col].max()
+        else:
+            col_summary['Mean'] = col_summary['Std'] = col_summary['Min'] = col_summary['Max'] = None
+
+        summary.append(col_summary)
+
+    return pd.DataFrame(summary)
+
+#########################################################################################################################
+
+def calculate_drop_slopes(df, cols, windows=None, to_per='h'):
+    """
+    Calculate rolling drop-only slopes for given columns over specified time windows.
+
+    Parameters:
+    - df: pandas DataFrame with a datetime index.
+    - cols: list of column names to process.
+    - windows: dict of label -> window string, e.g., {'1h': '1H'}
+    - to_per: 'h' for L/h output, 's' for L/s output.
+
+    Returns:
+    - Modified DataFrame with new slope columns added.
+    """
+    # Ensure datetime index and sorted
+    df = df.copy()
+    df = df.sort_index()
+
+    # Default windows if none provided
+    if windows is None:
+        windows = {
+            '1h': '1H',
+            '2h': '2H',
+            '8h': '8H'
+        }
+
+    # Internal function: slope per second, safely
+    def _slope_seconds_safe(x):
+        t = x.index.astype(np.int64) // 10**9
+        y = x.values
+        mask = ~np.isnan(y)
+        if mask.sum() < 2 or np.nanstd(y[mask]) == 0:
+            return np.nan
+        try:
+            return np.polyfit(t[mask], y[mask], 1)[0]
+        except np.linalg.LinAlgError:
+            return np.nan
+
+    # Rolling slope wrapper
+    def rolling_slope(series, window, to_per='h'):
+        slopes_per_s = series.rolling(window, min_periods=2).apply(_slope_seconds_safe, raw=False)
+        return slopes_per_s * (3600 if to_per == 'h' else 1)
+
+    # Compute slopes
+    for col in cols:
+        drop_only = df[col].diff().clip(upper=0).abs()
+        for label, win in windows.items():
+            new_col = f"{col}_DropSlope_{label}_Lph" if to_per == 'h' else f"{col}_DropSlope_{label}_Lps"
+            if new_col not in df.columns:
+                df[new_col] = rolling_slope(drop_only, win, to_per)
+
+    return df
+################################################################################################################################
